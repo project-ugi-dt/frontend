@@ -1,35 +1,49 @@
-FROM python:3.11-slim
+# Используем Python 3.10-slim как базу
+FROM python:3.10-slim
 
-# Переменные для сборки образа
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+# 1. Устанавливаем системные библиотеки (GDAL для карт)
+# Это нужно делать ДО установки Python-пакетов
+RUN apt-get update && apt-get install -y \
+    binutils \
+    libproj-dev \
+    gdal-bin \
+    libgdal-dev \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Настройки для корректной сборки GDAL/Rasterio (если uv решит собирать из исходников)
+ENV CPLUS_INCLUDE_PATH=/usr/include/gdal
+ENV C_INCLUDE_PATH=/usr/include/gdal
+
+# 2. Устанавливаем uv (копируем официальный бинарник — это best practice)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+
+# Настройки uv для Docker
+ENV UV_COMPILE_BYTECODE=1 
+ENV UV_LINK_MODE=copy
 
 WORKDIR /app
 
-# Установка зависимостей для Shapely/Pyproj
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
-    && rm -rf /var/lib/apt/lists/*
+# 3. Сначала копируем файлы зависимостей (для кэширования слоев Docker)
+# Если вы не меняли зависимости, Docker пропустит этот шаг и возьмет кэш
+COPY pyproject.toml uv.lock ./
 
-# Установка UV
-RUN pip install --no-cache-dir uv
+# 4. Синхронизируем зависимости
+# --frozen: строго использовать uv.lock (не обновлять версии)
+# --no-install-project: пока не ставим само приложение, только библиотеки
+RUN uv sync --frozen --no-install-project --no-dev
 
-# Копирование и установка зависимостей
-COPY pyproject.toml uv.lock .
-RUN uv sync --frozen
+# 5. Копируем остальной код
+COPY . .
 
-# Копирование кода
-COPY hse_geosensors.py ./hse_geosensors.py
-COPY output ./output
+# 6. Доустанавливаем проект (если он оформлен как пакет) или просто убеждаемся, что всё ок
+RUN uv sync --frozen --no-dev
 
-# Порт по умолчанию, если не указан в .env
-EXPOSE ${PORT:-8080}
+# Добавляем виртуальное окружение uv в PATH, чтобы команды python/flask работали напрямую
+ENV PATH="/app/.venv/bin:$PATH"
 
-# Запуск Gunicorn с переменными из окружения (.env подтягивается через Compose или --env-file)
-CMD sh -c "/app/.venv/bin/gunicorn \
-  -w ${GUNICORN_WORKERS:-2} \
-  -k gthread \
-  --threads ${GUNICORN_THREADS:-4} \
-  -b 0.0.0.0:${PORT:-8080} \
-  --timeout ${GUNICORN_TIMEOUT:-120} \
-  hse_geosensors:app"
+EXPOSE 8080
+
+# 7. Запускаем через uv run или напрямую python (так как PATH уже настроен)
+CMD ["uv", "run", "app.py"]
